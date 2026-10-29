@@ -1,0 +1,240 @@
+/**
+ * Amaze Pods - Free-Trial Lead Handler
+ * Google Form -> Google Sheet -> AI-drafted parent reply -> Gmail draft.
+ * A human reviews every draft before anything is sent.
+ * Status moves from New to Contacted automatically once the draft is sent.
+ *
+ * Setup: add GEMINI_API_KEY in Project Settings > Script Properties,
+ * then run setup() and setupStatusSync() once.
+ */
+
+const CONFIG = {
+  MODEL: 'gemini-3.8-flash', // change here if Google retires this model name
+  FALLBACK_MODEL: '',        // optional: a second model to try if the first keeps failing
+  SHEET_NAME: 'Form Responses 1',
+  DRAFT_COL: 'AI Draft',
+  STATUS_COL: 'Status',
+  DRAFT_ID_COL: 'Draft ID',
+  STATUSES: ['New', 'Contacted', 'Trial booked'],
+  NOTIFY_EMAIL: 'youraddress@gmail.com', // team inbox for new-lead alerts ('' to turn off)
+  // Form question titles. Matching ignores case, spaces and punctuation.
+  FIELDS: {
+    name: 'Parent name',
+    email: 'Parent email',
+    grade: "Child's grade",
+    curriculum: 'Curriculum',
+    subjects: 'Subjects',
+    timings: 'Preferred timings',
+    notes: 'Anything else we should know?'
+  }
+};
+
+// Edit this to change the tone or facts. Only state things you know are true.
+const SYSTEM_PROMPT = `You write first-reply emails for Amaze Pods, an online learning support service for Grades 1-10 (CBSE, IB, ICSE, IGCSE, International Curriculum).
+
+Facts you may use:
+- Formats: a 1-on-1 pod, or a small group pod of 4-6 learners.
+- Support covers schoolwork, homework help, revision, adaptive assessments and progress updates.
+- Parents get a private parent dashboard showing progress.
+- Everything starts with a 1-week free trial: meet the mentor, try live classes, discuss a study plan. The parent has the final say on format.
+- Subjects: English, Maths, Physics, Chemistry, Biology, History, Geography, Computer Science, Hindi.
+
+Tone: warm, relatable, encouraging, reassuring for busy parents. Plain language, no hype.
+
+Rules:
+- Start with a line "Subject: ..." then a blank line, then the email body.
+- Under 150 words.
+- Address the parent by name and mention the child's grade, curriculum and subjects.
+- Recommend either 1-on-1 or small group in one sentence, with a reason based on their notes. Make clear it is a suggestion.
+- Propose the free trial as the next step and say we will confirm timings with them.
+- Do NOT invent prices, mentor names, exact timings or guarantees.
+- Never use placeholders like [Parent Name]. If a detail is missing, leave it out or write around it.
+- Sign off as "Team Amaze Pods".`;
+
+/** Run once: adds columns, status dropdown, colours, and the form-submit trigger. */
+function setup() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const statusCol = getOrCreateCol_(sheet, CONFIG.STATUS_COL);
+  getOrCreateCol_(sheet, CONFIG.DRAFT_COL);
+  getOrCreateCol_(sheet, CONFIG.DRAFT_ID_COL);
+
+  const range = sheet.getRange(2, statusCol, sheet.getMaxRows() - 1, 1);
+  range.setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList(CONFIG.STATUSES, true).build()
+  );
+  const colors = { 'New': '#fde68a', 'Contacted': '#bfdbfe', 'Trial booked': '#bbf7d0' };
+  sheet.setConditionalFormatRules(
+    CONFIG.STATUSES.map(s =>
+      SpreadsheetApp.newConditionalFormatRule()
+        .whenTextEqualTo(s).setBackground(colors[s]).setRanges([range]).build()
+    )
+  );
+
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'onFormSubmit') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(ss).onFormSubmit().create();
+}
+
+/** Run once: checks every 15 minutes whether drafts have been sent. */
+function setupStatusSync() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'syncStatuses') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncStatuses').timeBased().everyMinutes(15).create();
+}
+
+/** Runs automatically on each new form submission. */
+function onFormSubmit(e) {
+  processRow_(e.range.getSheet(), e.range.getRow());
+}
+
+/** For testing: re-runs the handler on the last row that has a timestamp. */
+function testLastRow() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME);
+  const col = sheet.getRange(1, 1, sheet.getMaxRows(), 1).getValues();
+  let row = 1;
+  for (let i = col.length - 1; i >= 1; i--) {
+    if (col[i][0] !== '') { row = i + 1; break; }
+  }
+  if (row === 1) throw new Error('No form responses found.');
+  processRow_(sheet, row);
+}
+
+function processRow_(sheet, row) {
+  const statusCol = getOrCreateCol_(sheet, CONFIG.STATUS_COL);
+  const draftCol = getOrCreateCol_(sheet, CONFIG.DRAFT_COL);
+  const idCol = getOrCreateCol_(sheet, CONFIG.DRAFT_ID_COL);
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const values = sheet.getRange(row, 1, 1, lastCol).getValues()[0];
+
+  // Ignore case, spaces and punctuation when matching form titles to headers
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const get = key => {
+    const i = headers.findIndex(h => norm(h) === norm(CONFIG.FIELDS[key]));
+    return i === -1 ? '' : String(values[i] || '').trim();
+  };
+
+  const lead = {};
+  Object.keys(CONFIG.FIELDS).forEach(k => (lead[k] = get(k)));
+
+  try {
+    const reply = generateReply_(lead);
+    sheet.getRange(row, draftCol).setValue('Subject: ' + reply.subject + '\n\n' + reply.body);
+
+    if (lead.email) {
+      const draft = GmailApp.createDraft(lead.email, reply.subject, reply.body);
+      sheet.getRange(row, idCol).setValue(draft.getId());
+    }
+
+    // Alert goes to the team only, never to the parent
+    if (CONFIG.NOTIFY_EMAIL) {
+      try {
+        GmailApp.sendEmail(
+          CONFIG.NOTIFY_EMAIL,
+          'New trial enquiry: ' + (lead.name || 'unknown'),
+          'Grade: ' + lead.grade + '\nCurriculum: ' + lead.curriculum +
+          '\nSubjects: ' + lead.subjects +
+          '\n\nSuggested reply (also saved in Gmail Drafts):\n\nSubject: ' +
+          reply.subject + '\n\n' + reply.body
+        );
+      } catch (mailErr) {
+        console.error('Notification failed: ' + mailErr.message);
+      }
+    }
+  } catch (err) {
+    sheet.getRange(row, draftCol).setValue('ERROR: ' + err.message);
+  }
+  sheet.getRange(row, statusCol).setValue('New');
+}
+
+/** Marks leads as Contacted once their draft has been sent from Gmail. */
+function syncStatuses() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const statusCol = headers.indexOf(CONFIG.STATUS_COL);
+  const idCol = headers.indexOf(CONFIG.DRAFT_ID_COL);
+  const emailCol = headers.findIndex(h => norm(h) === norm(CONFIG.FIELDS.email));
+  if (statusCol === -1 || idCol === -1 || emailCol === -1) return;
+
+  const data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  data.forEach((r, i) => {
+    if (r[statusCol] !== 'New' || !r[idCol]) return;
+    try { GmailApp.getDraft(r[idCol]); return; } catch (e) { /* draft gone */ }
+    const sent = GmailApp.search('in:sent to:' + r[emailCol] + ' newer_than:14d');
+    if (sent.length) sheet.getRange(i + 2, statusCol + 1).setValue('Contacted');
+  });
+}
+
+function generateReply_(lead) {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) throw new Error('Missing GEMINI_API_KEY in Script Properties');
+
+  const userPrompt =
+    'Parent name: ' + (lead.name || 'not given') + '\n' +
+    "Child's grade: " + (lead.grade || 'not given') + '\n' +
+    'Curriculum: ' + (lead.curriculum || 'not given') + '\n' +
+    'Subjects: ' + (lead.subjects || 'not given') + '\n' +
+    'Preferred timings: ' + (lead.timings || 'not given') + '\n' +
+    'Notes: ' + (lead.notes || 'None');
+
+  // Try the main model, then the fallback (if set)
+  const models = [CONFIG.MODEL, CONFIG.FALLBACK_MODEL].filter(Boolean);
+  let res, usedModel;
+  for (const model of models) {
+    usedModel = model;
+    res = callModel_(model, key, userPrompt);
+    if (res.getResponseCode() === 200) break;
+  }
+
+  if (res.getResponseCode() !== 200) {
+    throw new Error('API ' + res.getResponseCode() + ' (' + usedModel + '): ' +
+      res.getContentText().slice(0, 200));
+  }
+  const text = JSON.parse(res.getContentText()).candidates[0].content.parts[0].text.trim();
+
+  const match = text.match(/^Subject:\s*(.+)$/im);
+  const subject = match ? match[1].trim() : 'Your free trial at Amaze Pods';
+  const body = text.replace(/^Subject:.*$/im, '').trim();
+  return { subject: subject, body: body };
+}
+
+/** Calls one model, retrying temporary failures (429 / 500 / 503) with growing waits. */
+function callModel_(model, key, userPrompt) {
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent';
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': key },
+    payload: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ parts: [{ text: userPrompt }] }]
+    }),
+    muteHttpExceptions: true
+  };
+
+  let res;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    res = UrlFetchApp.fetch(url, options);
+    const code = res.getResponseCode();
+    if (code === 200) break;
+    if (![429, 500, 503].includes(code)) break; // not temporary, stop retrying
+    Utilities.sleep(2000 * Math.pow(2, attempt)); // 2s, 4s, 8s, 16s
+  }
+  return res;
+}
+
+function getOrCreateCol_(sheet, header) {
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const idx = headers.indexOf(header);
+  if (idx !== -1) return idx + 1;
+  sheet.getRange(1, lastCol + 1).setValue(header);
+  return lastCol + 1;
+}
