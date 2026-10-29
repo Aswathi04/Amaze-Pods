@@ -79,3 +79,12 @@ All settings are at the top of `Code.gs`:
 - Instant auto-acknowledgement ("we got your request") for low-risk first contact, keeping the personalised reply under review.
 - Move to a shared inbox and a paid API tier once volume grows.
 - Track how often drafts are edited before sending, to decide when more automation is safe.
+
+## Screenshots
+
+<img width="868" height="873" alt="image" src="https://github.com/user-attachments/assets/4be7de5e-78ef-46ca-987b-906a5d6cb793" />
+<img width="1869" height="545" alt="image" src="https://github.com/user-attachments/assets/5c58418a-fbdf-4832-8547-92324e8b5272" />
+<img width="1532" height="830" alt="image" src="https://github.com/user-attachments/assets/d7e370f7-4107-4487-8f08-630fb51a3b59" />
+
+
+
